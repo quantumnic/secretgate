@@ -21,6 +21,13 @@ class SecretRedactionStep(PipelineStep):
         self._mode = mode  # "redact", "block", or "audit"
 
     async def process_request(self, body: dict, ctx: PipelineContext) -> dict | None:
+        # Determine effective mode: per-request override takes precedence
+        mode_override = ctx.metadata.get("mode_override")
+        effective_mode = mode_override if mode_override else self._mode
+
+        if mode_override:
+            logger.debug("using_mode_override", default_mode=self._mode, effective_mode=effective_mode)
+
         # First, scan scannable text to detect secrets (without mutating)
         all_text = self._extract_text(body)
         matches = self._scanner.scan(all_text)
@@ -37,11 +44,11 @@ class SecretRedactionStep(PipelineStep):
                 "secret_detected", service=m.service, pattern=m.pattern_name, line=m.line_number
             )
 
-        if self._mode == "block":
+        if effective_mode == "block":
             logger.error("request_blocked", secrets_found=len(matches))
             return None
 
-        if self._mode == "audit":
+        if effective_mode == "audit":
             logger.warning("secrets_audit_only", secrets_found=len(matches))
             return body
 

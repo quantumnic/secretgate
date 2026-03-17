@@ -26,6 +26,49 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
+# Header names for per-request scanning control
+HEADER_MODE = "x-secretgate-mode"  # audit, redact, block
+HEADER_SKIP = "x-secretgate-skip"  # true/false — skip scanning entirely
+
+
+def _extract_scanning_overrides(headers: dict) -> tuple[str | None, bool]:
+    """Extract per-request scanning overrides from headers.
+
+    Returns:
+        (mode_override, skip_scanning)
+        - mode_override: None or one of "audit", "redact", "block"
+        - skip_scanning: True if scanning should be skipped entirely
+    """
+    mode_override = None
+    skip_scanning = False
+
+    # Normalize header keys to lowercase for case-insensitive matching
+    headers_lower = {k.lower(): v for k, v in headers.items()}
+
+    # Check for mode override
+    if mode_val := headers_lower.get(HEADER_MODE):
+        mode_val = mode_val.lower().strip()
+        if mode_val in ("audit", "redact", "block"):
+            mode_override = mode_val
+            logger.debug("per_request_mode_override", mode=mode_override)
+
+    # Check for skip header
+    if skip_val := headers_lower.get(HEADER_SKIP):
+        skip_val = skip_val.lower().strip()
+        if skip_val in ("true", "1", "yes"):
+            skip_scanning = True
+            logger.debug("per_request_skip_scanning")
+
+    return mode_override, skip_scanning
+
+
+def _remove_secretgate_headers(headers: dict) -> dict:
+    """Remove secretgate-specific headers before forwarding to upstream."""
+    return {
+        k: v for k, v in headers.items()
+        if not k.lower().startswith("x-secretgate-")
+    }
+
 
 def create_provider_router(
     provider: ProviderConfig,
@@ -46,6 +89,12 @@ def create_provider_router(
         headers.pop("host", None)
         headers.pop("content-length", None)
 
+        # Extract per-request scanning overrides from headers
+        mode_override, skip_scanning = _extract_scanning_overrides(headers)
+
+        # Remove secretgate headers before forwarding to upstream
+        headers = _remove_secretgate_headers(headers)
+
         # For non-JSON, GET, or auth/token endpoints, pass through directly
         if (
             request.method == "GET"
@@ -54,6 +103,12 @@ def create_provider_router(
         ):
             return await _passthrough(request, upstream_url, headers, state.http_client)
 
+        # If skip_scanning is requested, pass through without pipeline
+        if skip_scanning:
+            logger.info("scanning_skipped_per_request", path=path)
+            raw_body = await request.body()
+            return await _forward_raw(raw_body, upstream_url, headers, state.http_client)
+
         # Parse JSON body
         raw_body = await request.body()
         try:
@@ -61,8 +116,9 @@ def create_provider_router(
         except (json.JSONDecodeError, UnicodeDecodeError):
             return await _forward_raw(raw_body, upstream_url, headers, state.http_client)
 
-        # Run request pipeline
+        # Run request pipeline with optional mode override
         ctx = PipelineContext()
+        ctx.metadata["mode_override"] = mode_override  # Pass to pipeline steps
         result = await pipeline.run_request(body, ctx)
 
         if result is None:
