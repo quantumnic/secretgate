@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import click
@@ -117,8 +121,25 @@ def serve(
     is_flag=True,
     help="Disable entropy-based detection (reduces false positives)",
 )
+@click.option(
+    "--report",
+    is_flag=True,
+    help="Show a colored summary report grouped by secret type",
+)
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Output results as JSON (ideal for CI/CD pipelines)",
+)
 @click.argument("files", nargs=-1, type=click.Path(exists=True))
-def scan(use_detect_secrets: bool, no_entropy: bool, files: tuple[str, ...]):
+def scan(
+    use_detect_secrets: bool,
+    no_entropy: bool,
+    report: bool,
+    json_output: bool,
+    files: tuple[str, ...],
+):
     """Scan files or stdin for secrets.
 
     Pass file paths as arguments, or pipe text via stdin.
@@ -127,10 +148,11 @@ def scan(use_detect_secrets: bool, no_entropy: bool, files: tuple[str, ...]):
     Examples:
         secretgate scan .env config.yaml
         secretgate scan --no-entropy src/
+        secretgate scan --report .env
+        secretgate scan --json .env
         cat .env | secretgate scan
         git diff --cached | secretgate scan
     """
-    import sys
     from secretgate.secrets.scanner import SecretScanner
 
     scanner = SecretScanner(
@@ -138,25 +160,42 @@ def scan(use_detect_secrets: bool, no_entropy: bool, files: tuple[str, ...]):
         enable_entropy=not no_entropy,
     )
     total_matches = []
+    file_matches: dict[str, list] = {}
 
     if files:
         for filepath in files:
             with open(filepath) as f:
                 text = f.read()
             matches = scanner.scan(text)
-            for m in matches:
-                preview = m.value[:8] + "..." if len(m.value) > 8 else m.value
-                click.echo(
-                    f"  {filepath}:{m.line_number}: [{m.service}] {m.pattern_name} — {preview}"
-                )
+            if not json_output and not report:
+                for m in matches:
+                    preview = m.value[:8] + "..." if len(m.value) > 8 else m.value
+                    click.echo(
+                        f"  {filepath}:{m.line_number}: [{m.service}] {m.pattern_name} — {preview}"
+                    )
+            file_matches[filepath] = matches
             total_matches.extend(matches)
     else:
         text = sys.stdin.read()
         matches = scanner.scan(text)
-        for m in matches:
-            preview = m.value[:8] + "..." if len(m.value) > 8 else m.value
-            click.echo(f"  Line {m.line_number}: [{m.service}] {m.pattern_name} — {preview}")
+        if not json_output and not report:
+            for m in matches:
+                preview = m.value[:8] + "..." if len(m.value) > 8 else m.value
+                click.echo(f"  Line {m.line_number}: [{m.service}] {m.pattern_name} — {preview}")
+        file_matches["<stdin>"] = matches
         total_matches.extend(matches)
+
+    if json_output:
+        _output_json(total_matches, file_matches)
+        if total_matches:
+            sys.exit(1)
+        return
+
+    if report:
+        _output_report(total_matches, file_matches)
+        if total_matches:
+            sys.exit(1)
+        return
 
     if not total_matches:
         click.echo("No secrets found.")
@@ -164,6 +203,89 @@ def scan(use_detect_secrets: bool, no_entropy: bool, files: tuple[str, ...]):
 
     click.echo(f"\n{len(total_matches)} secret(s) found.")
     sys.exit(1)
+
+
+def _output_json(total_matches: list, file_matches: dict) -> None:
+    """Output scan results as JSON."""
+    import json as json_mod
+
+    results = {
+        "total": len(total_matches),
+        "files_scanned": len(file_matches),
+        "secrets": [],
+        "summary": {},
+    }
+
+    for filepath, matches in file_matches.items():
+        for m in matches:
+            results["secrets"].append(
+                {
+                    "file": filepath,
+                    "line": m.line_number,
+                    "service": m.service,
+                    "pattern": m.pattern_name,
+                    "confidence": "high" if m.service != "entropy" else "medium",
+                    "preview": m.value[:8] + "..." if len(m.value) > 8 else m.value,
+                }
+            )
+
+    # Build summary by service/pattern
+    from collections import Counter
+
+    type_counts = Counter(f"{m.service}/{m.pattern_name}" for m in total_matches)
+    results["summary"] = dict(type_counts.most_common())
+
+    click.echo(json_mod.dumps(results, indent=2))
+
+
+def _output_report(total_matches: list, file_matches: dict) -> None:
+    """Output a colored summary report."""
+    from collections import Counter
+
+    if not total_matches:
+        click.secho("✅ No secrets found.", fg="green", bold=True)
+        return
+
+    click.echo()
+    click.secho("╔══════════════════════════════════════════╗", fg="red", bold=True)
+    click.secho("║        SECRET SCAN REPORT                ║", fg="red", bold=True)
+    click.secho("╚══════════════════════════════════════════╝", fg="red", bold=True)
+    click.echo()
+
+    # Summary by type
+    type_counts = Counter(f"{m.service}/{m.pattern_name}" for m in total_matches)
+    click.secho("Secret Types Found:", fg="yellow", bold=True)
+    click.echo()
+    for secret_type, count in type_counts.most_common():
+        service, pattern = secret_type.split("/", 1)
+        confidence = "🟢 high" if service != "entropy" else "🟡 medium"
+        click.echo(f"  {'🔑' if count > 1 else '🔐'} ", nl=False)
+        click.secho(f"{pattern}", fg="red", bold=True, nl=False)
+        click.echo(f" ({service}) — ", nl=False)
+        click.secho(f"{count}", fg="cyan", bold=True, nl=False)
+        click.echo(f" occurrence(s) — confidence: {confidence}")
+
+    click.echo()
+
+    # File breakdown
+    files_with_secrets = {f: m for f, m in file_matches.items() if m}
+    if len(files_with_secrets) > 1:
+        click.secho("Files Affected:", fg="yellow", bold=True)
+        click.echo()
+        for filepath, matches in files_with_secrets.items():
+            click.echo(f"  📄 {filepath}: ", nl=False)
+            click.secho(f"{len(matches)} secret(s)", fg="red")
+        click.echo()
+
+    # Totals
+    click.secho("─" * 44, fg="white")
+    click.echo("  Total secrets: ", nl=False)
+    click.secho(f"{len(total_matches)}", fg="red", bold=True)
+    click.echo("  Files scanned: ", nl=False)
+    click.secho(f"{len(file_matches)}", fg="cyan")
+    click.echo("  Files affected: ", nl=False)
+    click.secho(f"{len(files_with_secrets)}", fg="yellow")
+    click.echo()
 
 
 def _find_available_port(preferred: int, max_attempts: int = 20) -> int:
@@ -202,8 +324,20 @@ def _find_available_port(preferred: int, max_attempts: int = 20) -> int:
     default="redact",
     help="How to handle detected secrets",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Stream proxy logs to stderr in addition to the log file",
+)
+@click.option(
+    "--log-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Log file path (default: ~/.secretgate/wrap.log or $SECRETGATE_LOG_FILE)",
+)
 @click.pass_context
-def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
+def wrap(ctx, forward_proxy_port: int, port: int, mode: str, verbose: bool, log_file: Path | None):
     """Run a command with all traffic routed through secretgate.
 
     Starts the forward proxy in the background, sets proxy env vars,
@@ -212,15 +346,13 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
     \b
     Examples:
         secretgate wrap -- claude
-        secretgate wrap -- curl https://example.com
-        secretgate wrap --mode audit -- bash
+        secretgate wrap -v -- claude          # stream logs to stderr
+        secretgate wrap --mode audit -- bash  # audit mode
         secretgate wrap -- git push
     """
     import atexit
-    import os
+    import shutil
     import socket
-    import subprocess
-    import sys
     import time
 
     from secretgate.certs import CertAuthority
@@ -245,10 +377,15 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
     # Ensure CA exists and create combined bundle
     ca = CertAuthority()
     ca.ensure_ca()
-    # Use combined bundle (system CAs + secretgate CA) so tools trust both
-    # the MITM cert and upstream servers
     bundle_path = ca.create_ca_bundle()
     ca_path = str(bundle_path) if bundle_path else str(ca.ca_cert_path)
+
+    # Determine log file path
+    if log_file is None:
+        log_file = Path(os.environ.get("SECRETGATE_LOG_FILE", ""))
+        if not str(log_file) or str(log_file) == ".":
+            log_file = Path.home() / ".secretgate" / "wrap.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Start secretgate in background
     proxy_url = f"http://localhost:{forward_proxy_port}"
@@ -261,8 +398,6 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
 
-    import shutil
-
     # Find the secretgate binary — prefer the same entry point that invoked us
     secretgate_bin = shutil.which("secretgate") or sys.executable
     server_cmd = (
@@ -270,6 +405,8 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
         if secretgate_bin != sys.executable
         else [sys.executable, "-m", "secretgate", "serve"]
     )
+
+    # Use subprocess.PIPE for stdout so we can tee to both log file and stderr
     server_proc = subprocess.Popen(
         [
             *server_cmd,
@@ -280,13 +417,37 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
             "--mode",
             mode,
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         **popen_kwargs,
     )
 
+    # Open log file and start tee thread
+    log_fh = open(log_file, "a")
+    stop_tee = threading.Event()
+
+    def _tee_output():
+        """Read from subprocess stdout, write to log file (and stderr if verbose)."""
+        try:
+            while not stop_tee.is_set():
+                line = server_proc.stdout.readline()
+                if not line:
+                    if server_proc.poll() is not None:
+                        break
+                    continue
+                log_fh.write(line.decode(errors="replace"))
+                log_fh.flush()
+                if verbose:
+                    click.echo(line.decode(errors="replace"), nl=False, err=True)
+        except Exception:
+            pass
+
+    tee_thread = threading.Thread(target=_tee_output, daemon=True)
+    tee_thread.start()
+
     def _cleanup_server():
         """Kill the server process — registered with atexit for robustness."""
+        stop_tee.set()
         if server_proc.poll() is None:
             server_proc.terminate()
             try:
@@ -294,6 +455,7 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
             except subprocess.TimeoutExpired:
                 server_proc.kill()
                 server_proc.wait(timeout=2)
+        log_fh.close()
 
     atexit.register(_cleanup_server)
 
@@ -301,14 +463,9 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
     for _ in range(50):
         # Check if the server process died early
         if server_proc.poll() is not None:
-            stderr_out = (
-                server_proc.stderr.read().decode(errors="replace") if server_proc.stderr else ""
-            )
             click.echo(
                 f"Error: secretgate exited unexpectedly (code {server_proc.returncode})", err=True
             )
-            if stderr_out:
-                click.echo(stderr_out[-500:], err=True)
             return
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -325,6 +482,9 @@ def wrap(ctx, forward_proxy_port: int, port: int, mode: str):
         return
 
     click.echo(f"secretgate running (PID {server_proc.pid})")
+    click.echo(f"Logs: {log_file}")
+    if verbose:
+        click.echo("Verbose mode: streaming logs to stderr")
 
     # Run the command with proxy env vars
     env = os.environ.copy()
